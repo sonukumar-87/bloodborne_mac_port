@@ -1,0 +1,477 @@
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// bbport (Metal-native M4): the presenter on the window's CAMetalLayer. The post-process pass
+// draws the guest's display buffer into a frame (the game image fitted into the window, so the
+// present is a 1:1 copy) on the draw scheduler; Present draws the frame letterboxed into a
+// drawable on a second command queue that waits for the frame's device tick. The shape follows
+// Huax-1839/bloodborne-macos's mtl_presenter.mm (GPL-2.0-or-later), without frame interpolation.
+
+#include "bbport_cpu.h"
+#include "bbport_framegen.h"
+#include "bbport_gpu_capture.h"
+#include "bbport_overlay.h"
+#include "bbport_toggles.h"
+#include "common/assert.h"
+#include "common/logging/log.h"
+#include "common/thread.h"
+#include "core/debug_state.h"
+#include "core/emulator_settings.h"
+#include "sdl_window.h"
+#include "video_core/renderer_metal/mtl_pso_cache.h"
+#include "video_core/renderer_metal/mtl_texture.h"
+#include "video_core/renderer_metal/vk_to_mtl.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+#include "video_core/texture_cache/blit_helper.h"
+#include "video_core/texture_cache/image.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstdio>
+#include <optional>
+#include <unistd.h>
+
+namespace Vulkan {
+
+namespace {
+
+/// MTLPixelFormatBGRA8Unorm: frames and drawables (the post-process pass writes gamma-encoded
+/// values, as into MoltenVK's swapchain before).
+constexpr u32 FrameFormat = 80;
+
+u64 NowNs() {
+    return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count());
+}
+
+Metal::LayerConfig LayerConfigFromEnv() {
+    Metal::LayerConfig config{};
+    config.pixel_format = FrameFormat;
+    // MoltenVK has no Mailbox and 0.4.0 fell back to Fifo: only Immediate turns display sync off.
+    config.display_sync = EmulatorSettings.GetPresentMode() != "Immediate";
+    // Two drawables up to a 60 FPS limit, as the Vulkan swapchain had (measured 2026-10-14:
+    // 48.5 -> 31.7 ms present latency at the same frame rate as three). Above it, three: with two
+    // on a 120 Hz display every frame longer than one refresh waits a whole extra refresh for a
+    // drawable, which locked 90 and 120 FPS limits at 60 (2026-10-17). BB_SWAPCHAIN_IMAGES
+    // overrides, CAMetalLayer takes 2..3.
+    const u32 limit = EmulatorSettings.GetFrameLimit();
+    config.max_drawables = limit == 0 || limit > 60 ? 3 : 2;
+    // bbport: frame generation presents twice per game frame: three drawables.
+    if (BbFrameGen::Requested()) {
+        config.max_drawables = 3;
+    }
+    if (const char* env = std::getenv("BB_SWAPCHAIN_IMAGES")) {
+        config.max_drawables = u32(std::clamp(std::atoi(env), 2, 3));
+    }
+    return config;
+}
+
+vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat format) {
+    switch (format) {
+    case Libraries::VideoOut::PixelFormat::A8B8G8R8Srgb:
+        return vk::Format::eR8G8B8A8Srgb;
+    case Libraries::VideoOut::PixelFormat::A8R8G8B8Srgb:
+        return vk::Format::eB8G8R8A8Srgb;
+    case Libraries::VideoOut::PixelFormat::A2R10G10B10:
+    case Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb:
+    case Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq:
+        return vk::Format::eA2R10G10B10UnormPack32;
+    default:
+        break;
+    }
+    UNREACHABLE_MSG("Unknown format={}", static_cast<u32>(format));
+    return {};
+}
+
+} // namespace
+
+Frame* Presenter::FramePool::Take() {
+    std::unique_lock lock{mutex};
+    cv.wait(lock, [this] { return !free.empty(); });
+    Frame* const frame = free.front();
+    free.pop_front();
+    return frame;
+}
+
+void Presenter::FramePool::Free(Frame* frame) {
+    {
+        std::scoped_lock lock{mutex};
+        free.push_back(frame);
+    }
+    cv.notify_one();
+}
+
+Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
+    : window{window_}, liverpool{liverpool_}, draw_scheduler{device, true},
+      runtime{device, draw_scheduler},
+      rasterizer{std::make_unique<Rasterizer>(device, draw_scheduler, runtime, liverpool)},
+      texture_cache{rasterizer->GetTextureCache()},
+      layer{window.GetWindowInfo().render_surface}, pp_pass{device, FrameFormat, FrameFormat},
+      present_queue{std::make_unique<Metal::PresentQueue>(device)},
+      pool{std::make_shared<FramePool>()} {
+    ASSERT_MSG(layer != nullptr, "Presenter: the window has no CAMetalLayer");
+    if (const char* env = std::getenv("BB_SNAPSHOT_TRIGGER"); env && *env) {
+        snapshot_trigger = env;
+    }
+    Metal::LayerConfig config = LayerConfigFromEnv();
+    // Snapshots read the drawable back.
+    config.framebuffer_only = snapshot_trigger.empty();
+    Metal::ConfigureLayer(device, layer, config);
+    // The settings menu and FPS counter, drawn into the drawable (Present).
+    BbOverlay::Init(device, FrameFormat);
+    for (u32 i = 0; i < FramePool::Count; ++i) {
+        pool->frames[i].id = i;
+        pool->free.push_back(&pool->frames[i]);
+    }
+    fsr_settings.enable = EmulatorSettings.IsFsrEnabled();
+    fsr_settings.use_rcas = EmulatorSettings.IsRcasEnabled();
+    fsr_settings.rcas_attenuation = static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
+    if (fsr_settings.enable) {
+        fsr_pass = std::make_unique<HostPasses::FsrPass>(device);
+    }
+    if (BbFrameGen::Requested()) {
+        frame_gen = std::make_unique<BbFrameGen::Interpolator>(device);
+        if (!frame_gen->Usable()) {
+            frame_gen.reset();
+        }
+    }
+    std::printf("Presenter: CAMetalLayer, %u drawables, display sync %s, frame limit %u\n",
+                config.max_drawables, config.display_sync ? "on" : "off",
+                EmulatorSettings.GetFrameLimit());
+}
+
+Presenter::~Presenter() {
+    // Bounded: a present stuck behind a device tick is logged and left behind (its completion
+    // handler only touches the frame pool, which it keeps alive).
+    present_queue.reset();
+    draw_scheduler.Finish();
+    if (rasterizer) {
+        rasterizer->GetPipelineCache().Sync();
+    }
+}
+
+bool Presenter::FlushPipelineArchive() {
+    return rasterizer->GetPipelineCache().Psos().Flush();
+}
+
+bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {
+    return std::ranges::find(vo_buffers_addr, color_buffer.Address()) != vo_buffers_addr.cend();
+}
+
+Frame* Presenter::GetRenderFrame(u32 width, u32 height) {
+    Frame* const frame = pool->Take();
+    if (!frame->texture || frame->width != width || frame->height != height) {
+        // Command buffers that still use the old texture hold references of their own
+        // (Encoder::KeepAlive in the post-process pass; the present command buffer).
+        Metal::TextureDesc desc{};
+        desc.pixel_format = FrameFormat;
+        desc.width = width;
+        desc.height = height;
+        desc.render_target = true;
+        frame->texture = Metal::CreateTexture(device, desc, "Frame", nullptr);
+        ASSERT_MSG(frame->texture, "Presenter: no {}x{} frame texture", width, height);
+        frame->width = width;
+        frame->height = height;
+    }
+    frame->is_hdr = false;
+    return frame;
+}
+
+Frame* Presenter::PrepareLastFrame() {
+    std::scoped_lock lock{pool->mutex};
+    Frame* const frame = pool->last_presented;
+    const auto it = std::ranges::find(pool->free, frame);
+    if (frame == nullptr || it == pool->free.end()) {
+        return nullptr;
+    }
+    pool->free.erase(it);
+    return frame;
+}
+
+Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
+                               VAddr cpu_address) {
+    // bbport: scaled upscaler presets: the output-size display buffer drawn by the port.
+    TemporalUpscaler::Display display{};
+    const bool upscaled = rasterizer->GetUpscaler().DisplayOverride(cpu_address, display);
+    const vk::Format view_format = GetFrameViewFormat(attribute.attrib.pixel_format);
+
+    // The source, viewed with its sRGB format and alpha One (the frame must not blend with UI).
+    Metal::Object input;
+    u32 image_width = 0;
+    u32 image_height = 0;
+    if (upscaled) {
+        // The display buffer has the guest render target's format; the video-out format views
+        // it as Vulkan's mutable-format view did (BGRA view of an RGBA buffer: the texture has
+        // PixelFormatView usage).
+        const u32 format =
+            Metal::SafeViewPixelFormat(Metal::TexturePixelFormat(display.texture),
+                                       Metal::VkToMtl::PixelFormat(view_format), true);
+        input = Metal::CreateTextureView(
+            display.texture, format, Metal::TextureType::Tex2D, 0, 1, 0, 1,
+            {Metal::VkToMtl::SwizzleRed, Metal::VkToMtl::SwizzleGreen,
+             Metal::VkToMtl::SwizzleBlue, Metal::VkToMtl::SwizzleOne});
+        ASSERT_MSG(input, "Presenter: no view of the upscaled display buffer");
+        image_width = display.width;
+        image_height = display.height;
+    } else {
+        auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
+        const VideoCore::ImageId image_id = texture_cache.FindImage(desc);
+        texture_cache.UpdateImage(image_id);
+        auto& image = texture_cache.GetImage(image_id);
+        VideoCore::ImageViewInfo view_info{};
+        view_info.format = view_format;
+        view_info.mapping.a = vk::ComponentSwizzle::eOne;
+        // The view belongs to the image's view cache: one more reference for the command buffer.
+        input = Metal::Object::Retain(image.FindView(view_info).Texture());
+        image_width = image.info.size.width;
+        image_height = image.info.size.height;
+        runtime.AccessImage(&image, false);
+    }
+
+    // The frame is the image fitted into the window (pixels), so Present copies it 1:1.
+    const Metal::FitRect fit = Metal::FitImage(image_width, image_height,
+                                               u32(std::max(window.GetWidth(), 0)),
+                                               u32(std::max(window.GetHeight(), 0)));
+    const u32 frame_width = fit.width ? fit.width : std::max(image_width, 1u);
+    const u32 frame_height = fit.height ? fit.height : std::max(image_height, 1u);
+    Frame* const frame = GetRenderFrame(frame_width, frame_height);
+
+    // Vulkan had no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches the
+    // post-process pass still sRGB encoded and is decoded there.
+    pp_settings.srgb_input =
+        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    if (fsr_pass) {
+        input = fsr_pass->Render(draw_scheduler, std::move(input), {image_width, image_height},
+                                 {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+    }
+    pp_pass.Render(draw_scheduler, std::move(input), Metal::Object::Retain(frame->texture.Get()),
+                   frame->width, frame->height, pp_settings);
+
+    // bbport: frame generation (BB_FRAME_GENERATION): the frame between the previous one and
+    // this, from the depth and motion of this frame's upscale; recorded after the frame itself.
+    frame->has_interp = false;
+    if (frame_gen) {
+        BbFrameGen::Inputs fg_inputs{};
+        const bool have = rasterizer->GetUpscaler().TakeFrameGenInputs(fg_inputs);
+        bool generated = false;
+        auto job = frame_gen->Prepare(frame->texture.Get(), frame->width, frame->height,
+                                      have ? &fg_inputs : nullptr, frame->interp, generated);
+        if (job) {
+            draw_scheduler.EndRendering();
+            draw_scheduler.Record(
+                [job = std::move(job)](Metal::Encoder& e) { BbFrameGen::Encode(e, *job); });
+            frame->has_interp = generated;
+        }
+    }
+
+    // Flush frame creation commands.
+    frame->ready_tick = draw_scheduler.CurrentTick();
+    const u64 flush_start = bbport::CpuCycles();
+    draw_scheduler.Flush();
+    const u64 flush_end = bbport::CpuCycles();
+    BbStats::flip_submit_ns.fetch_add(bbport::CyclesToNs(flush_end - flush_start),
+                                      std::memory_order_relaxed);
+    if (BbStats::enabled) {
+        WatchFrameCompletion(frame->ready_tick, flush_end);
+    }
+
+    // bbport: the GPU command thread runs at most BB_FRAMES_AHEAD (default 1) guest frames
+    // ahead of the GPU: it waits here for the frame that many flips back. When the GPU is the
+    // bottleneck it finishes frames at an even rate; without this bound the command thread ran
+    // ahead and then blocked wherever a resource ran out, so flips (and the guest's frame
+    // timing) came in bursts: 12.5/25 ms alternation at 80 FPS. 0 turns it off.
+    static const u32 frames_ahead = [] {
+        const char* env = std::getenv("BB_FRAMES_AHEAD");
+        return env ? u32(std::max(0, std::atoi(env))) : 1u;
+    }();
+    if (frames_ahead) {
+        recent_frame_ticks.push_back(frame->ready_tick);
+        while (recent_frame_ticks.size() > frames_ahead) {
+            const u64 tick = recent_frame_ticks.front();
+            recent_frame_ticks.pop_front();
+            if (recent_frame_ticks.size() == frames_ahead) {
+                const u64 wait_start = bbport::CpuCycles();
+                draw_scheduler.Wait(tick);
+                BbStats::frames_ahead_ns.fetch_add(
+                    bbport::CyclesToNs(bbport::CpuCycles() - wait_start), std::memory_order_relaxed);
+            }
+        }
+    }
+    return frame;
+}
+
+// bbport: frame timeline (BB_FRAME_STATS): a helper thread waits for each flip's submission
+// and adds the time from the commit's return to the GPU finishing it.
+void Presenter::WatchFrameCompletion(u64 tick, u64 submitted) {
+    std::scoped_lock lk{watch_mutex};
+    if (!watch_thread.joinable()) {
+        watch_thread = std::jthread([this](std::stop_token stop) {
+            Common::SetCurrentThreadName("bb:FrameWatch");
+            u64 last_done = 0;
+            while (!stop.stop_requested()) {
+                std::pair<u64, u64> item;
+                {
+                    std::unique_lock wl{watch_mutex};
+                    watch_cv.wait(wl, stop, [this] { return !watch_queue.empty(); });
+                    if (stop.stop_requested()) {
+                        return;
+                    }
+                    item = watch_queue.front();
+                    watch_queue.pop_front();
+                }
+                draw_scheduler.GetTimeline().Wait(item.first);
+                const u64 done = bbport::CpuCycles();
+                BbStats::gpu_latency_ns.fetch_add(bbport::CyclesToNs(done - item.second),
+                                                  std::memory_order_relaxed);
+                if (last_done) {
+                    BbStats::gpu_done_gap_ns.fetch_add(bbport::CyclesToNs(done - last_done),
+                                                       std::memory_order_relaxed);
+                    BbStats::gpu_done_frames.fetch_add(1, std::memory_order_relaxed);
+                }
+                last_done = done;
+            }
+        });
+    }
+    if (watch_queue.size() < 16) {
+        watch_queue.emplace_back(tick, submitted);
+        watch_cv.notify_one();
+    }
+}
+
+Frame* Presenter::PrepareBlankFrame(bool) {
+    // No content: Present clears the drawable black. No scheduler work, so either thread may ask.
+    Frame* const frame = pool->Take();
+    frame->ready_tick = 0;
+    return frame;
+}
+
+bool Presenter::SnapshotRequested() const {
+    return !snapshot_trigger.empty() && access(snapshot_trigger.c_str(), F_OK) == 0;
+}
+
+std::string Presenter::TakeSnapshotRequest() {
+    if (!SnapshotRequested()) {
+        return {};
+    }
+    std::string path;
+    if (FILE* file = std::fopen(snapshot_trigger.c_str(), "r")) {
+        char line[1024]{};
+        if (std::fgets(line, sizeof(line), file)) {
+            path = line;
+            while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) {
+                path.pop_back();
+            }
+        }
+        std::fclose(file);
+    }
+    std::remove(snapshot_trigger.c_str());
+    return path.empty() ? snapshot_trigger + ".png" : path;
+}
+
+void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame, u32) {
+    last_present = {NowNs(), 0, 0, 0};
+    // nextDrawable and the present passes create autoreleased objects, and this thread
+    // (bb:Present) has no pool of its own: without one, drawables never return to the layer.
+    Metal::WithAutoreleasePool([&] {
+        // Minimised, hidden or occluded: nextDrawable would block up to 1 s. The frame returns
+        // to the pool at once, so PrepareFrame's Take never waits on a skipped present.
+        if (!Metal::ShouldAcquireDrawable(window.IsVisible(), window.GetWidth(),
+                                          window.GetHeight(), SnapshotRequested())) {
+            BbOverlay::Render(nullptr, nullptr, 0, 0); // FPS timing, the menu's pending save
+            pool->Free(frame);
+            return;
+        }
+        Metal::Drawable drawable = Metal::NextDrawable(layer);
+        if (!drawable.drawable) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                LOG_WARNING(Render_Vulkan, "No drawable from the layer: skipping frame(s)");
+            }
+            BbOverlay::Render(nullptr, nullptr, 0, 0); // FPS timing, the menu's pending save
+            pool->Free(frame);
+            return;
+        }
+        last_present.acquired = NowNs();
+
+        // bbport: frame generation: the generated frame first, then this one (a frame shown
+        // again has no generated frame before it). The layer shows them on successive refreshes.
+        if (frame->has_interp && frame->interp && frame->ready_tick != 0 && !is_reusing_frame) {
+            void* const fg_buffer = present_queue->Begin();
+            const std::optional<u64> fg_tick =
+                draw_scheduler.GetTimeline().DeviceTickOf(frame->ready_tick);
+            ASSERT_MSG(fg_tick.has_value(), "Present: frame tick {} was not committed",
+                       frame->ready_tick);
+            present_queue->WaitForDeviceTick(fg_buffer, *fg_tick);
+            pp_pass.Passes().Present(fg_buffer, frame->interp.Get(), frame->width, frame->height,
+                                     drawable.texture, drawable.width, drawable.height);
+            BbOverlay::Render(fg_buffer, drawable.texture, drawable.width, drawable.height);
+            present_queue->Commit(fg_buffer, drawable.drawable.Get(), {});
+            drawable = Metal::NextDrawable(layer);
+            if (!drawable.drawable) {
+                pool->Free(frame);
+                return;
+            }
+        }
+
+        void* const command_buffer = present_queue->Begin();
+        void* source = nullptr;
+        if (frame->ready_tick != 0) {
+            // PrepareFrame flushed the tick, so it has a device tick (0: already complete).
+            const std::optional<u64> device_tick =
+                draw_scheduler.GetTimeline().DeviceTickOf(frame->ready_tick);
+            ASSERT_MSG(device_tick.has_value(), "Present: frame tick {} was not committed",
+                       frame->ready_tick);
+            present_queue->WaitForDeviceTick(command_buffer, *device_tick);
+            source = frame->texture.Get();
+        }
+        // A blank frame clears the drawable. Every acquired drawable is presented: one that is
+        // not returns to the layer only after about a display refresh.
+        pp_pass.Passes().Present(command_buffer, source, frame->width, frame->height,
+                                 drawable.texture, drawable.width, drawable.height);
+        // The settings menu / FPS counter over the presented image, before the snapshot (which
+        // shows it) and the commit. Called every present: it also times the FPS readout and
+        // saves menu changes while nothing is drawn.
+        BbOverlay::Render(command_buffer, drawable.texture, drawable.width, drawable.height);
+        std::string snapshot_path = TakeSnapshotRequest();
+        std::shared_ptr<Metal::Object> snapshot;
+        if (!snapshot_path.empty()) {
+            snapshot = std::make_shared<Metal::Object>(Metal::EncodeSnapshot(
+                device, command_buffer, drawable.texture, drawable.width, drawable.height));
+        }
+        present_queue->Commit(
+            command_buffer, drawable.drawable.Get(),
+            [pool = pool, frame, snapshot, path = std::move(snapshot_path),
+             width = drawable.width, height = drawable.height] {
+                pool->Free(frame);
+                if (snapshot && *snapshot) {
+                    // Off the completion thread: it is serial, and the PNG takes ~150 ms that
+                    // later presents would wait behind.
+                    std::thread([snapshot, path, width, height] {
+                        const bool ok = Metal::WriteSnapshotPng(path.c_str(), snapshot->Get(),
+                                                                width, height);
+                        std::printf("Snapshot: %s %ux%u %s\n", path.c_str(), width, height,
+                                    ok ? "written" : "FAILED");
+                        std::fflush(stdout);
+                    }).detach();
+                }
+            });
+        last_present.submitted = NowNs();
+        last_present.presented = last_present.submitted;
+    });
+    BbGpuCapture::OnPresent(device.NativeDevice()); // bbport: BB_GPU_CAPTURE one-frame capture
+
+    if (!is_reusing_frame) {
+        std::scoped_lock lock{pool->mutex};
+        pool->last_presented = frame;
+    }
+    if (!is_reusing_frame && is_game_frame) {
+        DebugState.IncFlipFrameNum();
+    }
+}
+
+} // namespace Vulkan

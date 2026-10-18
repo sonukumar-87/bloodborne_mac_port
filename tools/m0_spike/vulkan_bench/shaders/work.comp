@@ -1,0 +1,8 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer Sb { vec4 v[]; } sb;
+layout(push_constant) uniform Pc { uvec4 a; } pc;
+void main() {
+    uint i = (gl_GlobalInvocationID.x + pc.a.x) & 1023u;
+    sb.v[i] = sb.v[i] * 0.5 + vec4(float(pc.a.y));
+}

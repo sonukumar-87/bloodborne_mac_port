@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: test kernel for HostKernel::sampler_slot (tests/test_mtl_host_kernel.mm): samples a
+// combined image sampler at four push-constant coordinates. The storage image comes first so
+// that the sampler's binding (1) differs from its MSL slot.
+#version 450
+
+layout(local_size_x = 4) in;
+
+layout(binding = 0, rgba32f) uniform writeonly image2D result;
+layout(binding = 1) uniform sampler2D tex;
+
+layout(push_constant) uniform Params {
+    vec2 uv[4];
+} params;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    imageStore(result, ivec2(i, 0), textureLod(tex, params.uv[i], 0.0));
+}
