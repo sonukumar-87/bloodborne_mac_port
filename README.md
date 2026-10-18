@@ -24,6 +24,10 @@ below this section is the original project's README. It adds:
 
 ### Frame generation (MetalFX frame interpolation)
 
+![Bloodborne on an Apple M4 Pro with frame generation: 115 FPS, FSR 3.1 1706x960 to 2560x1440](docs/images/m4-pro-frame-generation.webp)
+
+*Apple M4 Pro (MacBook Pro), 2560 × 1440 with FSR 3.1 Quality (rendered at 1706 × 960), Metal renderer, 60 FPS cap with frame generation on: **115 FPS** on screen (8.7 ms).*
+
 - Apple's **MetalFX frame interpolation** (macOS 26+) generates a frame between every two real
   frames: at a **60 FPS cap on a 120 Hz display** the game shows 120 frames per second.
 - Works with the **Metal renderer** and an upscaler (**FSR 3.1, MetalFX or TAA**), which provide
