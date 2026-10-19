@@ -1,5 +1,7 @@
 /* Offline AppContent provider for the configured base-game profile.
- * No package/DLC mounting, downloads, entitlement or license emulation. */
+ * Add-ons (DLC): BB_ADDCONT lists extracted add-on folders (':'-separated, each with
+ * sce_sys/param.sfo of CATEGORY "ac"); each is reported installed under the entitlement label of
+ * its CONTENT_ID. No downloads or license checks. */
 #include "runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,12 +71,56 @@ static ABI int32_t param_int(uint32_t id,int32_t *out) {
     printf("Runtime: AppContent parameter %u = %d\n",id,*out);
     return 0;
 }
+/* SceAppContentAddcontInfo: the entitlement label (16 characters, NUL, 3 padding) and the
+ * download status (4: installed). */
+typedef struct { char label[17]; char padding[3]; uint32_t status; } AddonInfo;
+enum { MAX_ADDONS=32, ADDON_INSTALLED=4 };
+static AddonInfo addons[MAX_ADDONS];
+static unsigned addon_count, addons_read;
+/* CONTENT_ID of a param.sfo, or 0. */
+static int sfo_content_id(const char *path, char out[64]) {
+    FILE *f=fopen(path,"rb");
+    if (!f) return 0;
+    unsigned char d[8192]; size_t n=fread(d,1,sizeof(d),f); fclose(f);
+    if (n<20 || memcmp(d,"\0PSF",4)) return 0;
+    uint32_t keys,data,count; memcpy(&keys,d+8,4); memcpy(&data,d+12,4); memcpy(&count,d+16,4);
+    for (uint32_t i=0;i<count && 20+i*16+16<=n;++i) {
+        const unsigned char *e=d+20+i*16; uint16_t ko; uint32_t len,off;
+        memcpy(&ko,e,2); memcpy(&len,e+4,4); memcpy(&off,e+12,4);
+        if (keys+ko>=n || data+off+len>n) continue;
+        if (strcmp((const char *)d+keys+ko,"CONTENT_ID")) continue;
+        if (len>=64) len=63;
+        memcpy(out,d+data+off,len); out[len]=0; return 1;
+    }
+    return 0;
+}
+void runtime_content_read_addons(const char *spec) {
+    addons_read=1;
+    if (!spec || !*spec) return;
+    char copy[4096]; snprintf(copy,sizeof(copy),"%s",spec);
+    for (char *dir=strtok(copy,":"); dir && addon_count<MAX_ADDONS; dir=strtok(NULL,":")) {
+        char path[4200], id[64];
+        snprintf(path,sizeof(path),"%s/sce_sys/param.sfo",dir);
+        /* XXYYYY-CUSAnnnnn_00-LABEL: the label is the 16 characters after the last '-'. */
+        const char *label=sfo_content_id(path,id) ? strrchr(id,'-') : NULL;
+        if (!label || strlen(label+1)!=16) { printf("Runtime: add-on %s: no CONTENT_ID with a 16-character label, skipped\n",dir); continue; }
+        AddonInfo *a=&addons[addon_count++];
+        memset(a,0,sizeof(*a)); memcpy(a->label,label+1,16); a->status=ADDON_INSTALLED;
+        printf("Runtime: add-on %s installed (%s)\n",a->label,id);
+    }
+}
 static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
     require_initialized();
     if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
     if ((!capacity || !list) && !hits) return PARAMETER;
-    /* No add-ons are mounted by this provider. Never touch unused list slots. */
-    if (hits) *hits=0;
+    if (!addons_read) runtime_content_read_addons(getenv("BB_ADDCONT"));
+    /* Never touch list slots past what is reported. */
+    unsigned shown=addon_count;
+    if (list && capacity) {
+        if (shown>capacity) shown=capacity;
+        memcpy(list,addons,shown*sizeof(AddonInfo));
+    }
+    if (hits) *hits=list && capacity ? shown : addon_count;
     ++lists; return 0;
 }
 uintptr_t runtime_content_resolve(const char *name) {

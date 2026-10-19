@@ -168,6 +168,14 @@ fi
 if [[ -z ${BB_FRAME_GENERATION:-} ]] && grep -q '^frame_generation=1' "$fg_ini" 2>/dev/null; then
     export BB_FRAME_GENERATION=1
 fi
+# Add-ons (DLC): extracted add-on folders (each with sce_sys/param.sfo) in BB_ADDCONT_DIR, by
+# default the data folder's addcont/; BB_ADDCONT set by hand wins (':'-separated folders).
+if [[ -z ${BB_ADDCONT:-} ]]; then
+    for addon in "${BB_ADDCONT_DIR:-$data/addcont}"/*/; do
+        [[ -f $addon/sce_sys/param.sfo ]] && BB_ADDCONT+=${BB_ADDCONT:+:}${addon%/}
+    done
+    export BB_ADDCONT
+fi
 probe_args=("$out/boot-linked.bin" --content-profile "$out/content.bin" --patches "$out/patches.bin" --app0 "$game" --user "${BB_USER_DIR:-$data/user}" --timeout "${BB_TIMEOUT:-0}" "$@")
 if [[ -n ${mod_game:-} ]]; then
     "$probe" "${probe_args[@]}" &
