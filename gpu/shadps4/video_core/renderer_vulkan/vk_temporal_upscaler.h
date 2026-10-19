@@ -281,6 +281,8 @@ private:
     vk::Format ui_format = vk::Format::eUndefined;
     vk::Format ui_depth_format = vk::Format::eUndefined;
     Metal::Object ui_image;       ///< output size, the UI's format (PixelFormatView usage)
+    Metal::Object ui_scene_image; ///< bbport frame generation: ui_image before the UI draws
+    u32 ui_scene_width = 0, ui_scene_height = 0;
     Metal::Object ui_depth_image; ///< output size, the UI's depth format
     std::vector<MirrorView> ui_views;
     struct DisplayImage {

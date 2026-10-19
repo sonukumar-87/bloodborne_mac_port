@@ -37,10 +37,20 @@ struct Inputs {
     float near_plane{}, far_plane{};
     float vertical_fov{}; ///< radians
     bool reset{};         ///< the upscaler restarted its history (camera cut, settings change)
+    /// Scaled presets (UI drawn at output size over the upscaled scene): the UI image as
+    /// finished (`ui_final`) and a copy of it taken before the first UI draw (`ui_scene`), both
+    /// id<MTLTexture>, output size, same format. Where they differ is the HUD, which is kept
+    /// out of the interpolation and drawn steady on top. Null otherwise.
+    void* ui_final{};
+    void* ui_scene{};
 };
 
 /// BB_FRAME_GENERATION=1 (read once).
 bool Requested();
+
+/// Copies the whole of `source` into `destination` (id<MTLTexture>, same size and format), inside
+/// a Scheduler::Record closure: the HUD-free copy of the UI image (TemporalUpscaler::RunScaled).
+void CopyTexture(Metal::Encoder& e, void* source, void* destination);
 
 /// The work one frame records on the draw scheduler (Encode, inside a Scheduler::Record closure).
 struct Job;

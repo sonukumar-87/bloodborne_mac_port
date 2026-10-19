@@ -65,7 +65,69 @@ bool IsDepthFormat(uint32_t format) {
     }
 }
 
+/// The HUD layer: MetalFX's composited UI mode takes the frame WITHOUT the HUD as its colour (both
+/// frames') and the finished frame as its UI texture, and separates the HUD itself. This writes the
+/// frame without the HUD: the frame's own pixel, except where the finished UI image differs from its
+/// copy taken before the UI draws (3x3 neighbourhood, so anti-aliased edges count), there the copy.
+/// params.x: threshold in 1/1024ths. Passing the HUD alone as the UI texture with the composited
+/// mode (as before) makes MetalFX draw the generated frames' scene black: every other frame dark,
+/// a blinking picture with wrong colours.
+constexpr const char* HudMaskSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void hud_mask(texture2d<float, access::read> frame [[texture(0)]],
+                     texture2d<float, access::sample> ui_final [[texture(1)]],
+                     texture2d<float, access::sample> ui_scene [[texture(2)]],
+                     texture2d<float, access::write> scene [[texture(3)]],
+                     constant uint2& params [[buffer(0)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    const uint w = scene.get_width(), h = scene.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    constexpr sampler nearest(coord::normalized, filter::nearest, address::clamp_to_edge);
+    constexpr sampler bilinear(coord::normalized, filter::linear, address::clamp_to_edge);
+    const float2 uv = (float2(gid) + 0.5) / float2(w, h);
+    const float2 step = max(1.0 / float2(ui_final.get_width(), ui_final.get_height()), 1.0 / float2(w, h));
+    float diff = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const float2 p = uv + float2(dx, dy) * step;
+            const float3 d = abs(ui_final.sample(nearest, p).rgb - ui_scene.sample(nearest, p).rgb);
+            diff = max(diff, max(d.r, max(d.g, d.b)));
+        }
+    }
+    float4 result = frame.read(gid);
+    if (diff > float(params.x) / 1024.0) {
+        result = float4(ui_scene.sample(bilinear, uv).rgb, 1.0);
+    }
+    scene.write(result, gid);
+}
+)";
+
 } // namespace
+
+void CopyTexture(Metal::Encoder& e, void* source, void* destination) {
+    e.EndEncoding();
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)e.CommandBuffer();
+    @autoreleasepool {
+        id<MTLTexture> src = (__bridge id<MTLTexture>)source;
+        id<MTLTexture> dst = (__bridge id<MTLTexture>)destination;
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        blit.label = @"Frame generation UI scene copy";
+        [blit copyFromTexture:src
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(std::min(src.width, dst.width),
+                                          std::min(src.height, dst.height), 1)
+                    toTexture:dst
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+    }
+    e.KeepAlive(Metal::Object::Retain(source));
+    e.KeepAlive(Metal::Object::Retain(destination));
+}
 
 bool Requested() {
     static const bool requested = [] {
@@ -82,6 +144,10 @@ struct Job {
     Metal::Object depth_source, motion_source;
     Metal::Object depth, motion; ///< scene-size copies
     Metal::Object output;
+    Metal::Object hud_pipeline;      ///< id<MTLComputePipelineState> (hud_mask)
+    Metal::Object hud;               ///< the HUD layer (uiTexture), frame size
+    Metal::Object ui_final, ui_scene; ///< empty: no UI information this frame
+    uint32_t hud_threshold{6};
     uint32_t width{}, height{};  ///< scene size (the copied region)
     float delta_time{}, near_plane{}, far_plane{}, fov_degrees{}, aspect{};
     std::array<float, 2> jitter{};
@@ -92,10 +158,11 @@ void Encode(Metal::Encoder& e, const Job& job) {
     e.EndEncoding();
     id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)e.CommandBuffer();
     @autoreleasepool {
+        const bool has_ui = job.hud_pipeline && job.ui_final && job.ui_scene;
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         blit.label = @"Frame generation inputs";
         id<MTLTexture> color = Tex(job.color);
-        [blit copyFromTexture:color
+        if (!has_ui) [blit copyFromTexture:color
                   sourceSlice:0
                   sourceLevel:0
                  sourceOrigin:MTLOriginMake(0, 0, 0)
@@ -127,6 +194,23 @@ void Encode(Metal::Encoder& e, const Job& job) {
         }
         [blit endEncoding];
 
+        if (has_ui) {
+            // This frame's colour (the next frame's previous image) without the HUD.
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            ce.label = @"Frame generation colour without the HUD";
+            [ce setComputePipelineState:(__bridge id<MTLComputePipelineState>)job.hud_pipeline.Get()];
+            [ce setTexture:color atIndex:0];
+            [ce setTexture:Tex(job.ui_final) atIndex:1];
+            [ce setTexture:Tex(job.ui_scene) atIndex:2];
+            [ce setTexture:Tex(job.current) atIndex:3];
+            const uint32_t params[2] = {job.hud_threshold, 0u};
+            [ce setBytes:params length:sizeof(params) atIndex:0];
+            id<MTLTexture> current = Tex(job.current);
+            [ce dispatchThreadgroups:MTLSizeMake((current.width + 15) / 16, (current.height + 15) / 16, 1)
+                threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            [ce endEncoding];
+        }
+
         if (job.interpolator) {
             if (@available(macOS 26.0, *)) {
                 id<MTLFXFrameInterpolator> fi =
@@ -136,9 +220,10 @@ void Encode(Metal::Encoder& e, const Job& job) {
                 fi.depthTexture = Tex(job.depth);
                 fi.motionTexture = Tex(job.motion);
                 fi.outputTexture = Tex(job.output);
-                // The UI is part of the colour image: no separate UI texture.
-                fi.uiTexture = nil;
-                fi.uiTextureComposited = NO;
+                // The finished frame is the UI over the colour: MetalFX separates the HUD from
+                // it, keeps it out of the interpolation and draws it on top unchanged.
+                fi.uiTexture = has_ui ? color : nil;
+                fi.uiTextureComposited = has_ui ? YES : NO;
                 fi.deltaTime = job.delta_time;
                 fi.nearPlane = job.near_plane;
                 fi.farPlane = job.far_plane;
@@ -157,7 +242,8 @@ void Encode(Metal::Encoder& e, const Job& job) {
     // Command buffers do not retain what MetalFX and the blit use.
     for (const Metal::Object* object : {&job.interpolator, &job.color, &job.current, &job.previous,
                                         &job.depth_source, &job.motion_source, &job.depth,
-                                        &job.motion, &job.output}) {
+                                        &job.motion, &job.output, &job.hud_pipeline, &job.hud,
+                                        &job.ui_final, &job.ui_scene}) {
         if (*object) {
             e.KeepAlive(Metal::Object::Retain(object->Get()));
         }
@@ -178,7 +264,12 @@ struct Interpolator::Impl {
     uint32_t current = 0;
     bool previous_valid = false;
     bool last_generated = false; ///< the previous frame was interpolated (history continues)
+    bool previous_ui = false;    ///< the previous colour is without its HUD (the HUD layer)
     Metal::Object depth, motion;
+    Metal::Object hud;          ///< the HUD layer, frame size, colour format
+    Metal::Object hud_pipeline; ///< id<MTLComputePipelineState>; empty: no HUD layer (logged)
+    bool hud_tried = false;
+    uint32_t hud_threshold = 6;
     bool usage_checked = false;
     std::chrono::steady_clock::time_point last_frame{};
 
@@ -205,6 +296,7 @@ struct Interpolator::Impl {
                     d.outputTextureFormat = MTLPixelFormat(target.color_format);
                     d.depthTextureFormat = MTLPixelFormat(target.depth_format);
                     d.motionTextureFormat = MTLPixelFormatRG16Float;
+                    d.uiTextureFormat = MTLPixelFormat(target.color_format);
                     d.inputWidth = target.input_width;
                     d.inputHeight = target.input_height;
                     d.outputWidth = target.output_width;
@@ -246,6 +338,31 @@ struct Interpolator::Impl {
         }
     }
 
+    void MakeHudPipeline() {
+        hud_tried = true;
+        if (const char* env = std::getenv("BB_FRAME_GENERATION_HUD"); env && !std::strcmp(env, "0")) {
+            Log("Frame generation: HUD layer off (BB_FRAME_GENERATION_HUD=0)\n");
+            return;
+        }
+        if (const char* env = std::getenv("BB_FRAME_GENERATION_HUD_THRESHOLD")) {
+            hud_threshold = uint32_t(std::clamp(std::atoi(env), 1, 512));
+        }
+        id<MTLDevice> mtl = (__bridge id<MTLDevice>)device.NativeDevice();
+        NSError* error = nil;
+        id<MTLLibrary> library = [mtl newLibraryWithSource:@(HudMaskSource) options:nil error:&error];
+        id<MTLFunction> function = [library newFunctionWithName:@"hud_mask"];
+        id<MTLComputePipelineState> pipeline =
+            function ? [mtl newComputePipelineStateWithFunction:function error:&error] : nil;
+        if (!pipeline) {
+            Log("Frame generation: HUD layer shader failed (%s): the HUD is interpolated\n",
+                error ? error.localizedDescription.UTF8String : "no function");
+            return;
+        }
+        hud_pipeline = Metal::Object::Adopt((__bridge_retained void*)pipeline);
+        Log("Frame generation: HUD kept steady (MetalFX UI layer, threshold %u/1024)\n",
+            hud_threshold);
+    }
+
     bool CheckUsage(void* output) {
         if (@available(macOS 26.0, *)) {
             id<MTLFXFrameInterpolator> fi = (__bridge id<MTLFXFrameInterpolator>)interpolator.Get();
@@ -254,6 +371,7 @@ struct Interpolator::Impl {
             };
             if (has(Tex(frames[0]), fi.colorTextureUsage) && has(Tex(depth), fi.depthTextureUsage) &&
                 has(Tex(motion), fi.motionTextureUsage) &&
+                (!hud || has(Tex(hud), fi.uiTextureUsage)) &&
                 has((__bridge id<MTLTexture>)output, fi.outputTextureUsage)) {
                 return true;
             }
@@ -348,6 +466,11 @@ std::shared_ptr<Job> Interpolator::Prepare(void* color, uint32_t width, uint32_t
                               "Frame generation depth");
         s.motion = MakeTexture(s.device, MTLPixelFormatRG16Float, in->width, in->height, true,
                                true, "Frame generation motion");
+        s.hud = MakeTexture(s.device, config.color_format, width, height, true, true,
+                            "Frame generation HUD layer");
+        if (!s.hud_tried) {
+            s.MakeHudPipeline();
+        }
         if (!s.frames[0] || !s.frames[1] || !s.depth || !s.motion) {
             Log("Frame generation: cannot allocate its textures: off\n");
             s.failed = true;
@@ -381,7 +504,16 @@ std::shared_ptr<Job> Interpolator::Prepare(void* color, uint32_t width, uint32_t
     job->color = Metal::Object::Retain(color);
     job->current = Metal::Object::Retain(s.frames[s.current].Get());
     job->previous = Metal::Object::Retain(s.frames[s.current ^ 1].Get());
-    if (s.interpolator && s.previous_valid) {
+    // The HUD layer needs this frame's UI images; the previous colour must be of the same kind
+    // (with or without the HUD), else this frame only starts the history again.
+    const bool has_ui = s.hud_pipeline && in->ui_final && in->ui_scene;
+    if (has_ui) {
+        job->hud_pipeline = Metal::Object::Retain(s.hud_pipeline.Get());
+        job->hud_threshold = s.hud_threshold;
+        job->ui_final = Metal::Object::Retain(in->ui_final);
+        job->ui_scene = Metal::Object::Retain(in->ui_scene);
+    }
+    if (s.interpolator && s.previous_valid && s.previous_ui == has_ui) {
         job->interpolator = Metal::Object::Retain(s.interpolator.Get());
         job->depth_source = Metal::Object::Retain(in->depth);
         job->motion_source = Metal::Object::Retain(in->motion);
@@ -403,6 +535,7 @@ std::shared_ptr<Job> Interpolator::Prepare(void* color, uint32_t width, uint32_t
     // This frame's colour is the next frame's previous image.
     s.current ^= 1;
     s.previous_valid = true;
+    s.previous_ui = has_ui;
     return job;
 }
 

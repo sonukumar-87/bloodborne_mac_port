@@ -1124,6 +1124,32 @@ void TemporalUpscaler::RunScaled() {
             scale->ScaleColor(e, output, ui, Metal::ScaleFilter::Nearest);
         });
         scheduler.GetDynamicState().Invalidate();
+        // bbport: frame generation keeps the HUD steady: a copy of the UI image before the UI
+        // draws; where the finished UI image differs from it is the HUD.
+        if (BbFrameGen::Requested()) {
+            void* const ui = ui_image.Get();
+            const u32 format = Metal::TexturePixelFormat(ui);
+            if (!ui_scene_image || Metal::TexturePixelFormat(ui_scene_image.Get()) != format ||
+                ui_scene_width != ow || ui_scene_height != oh) {
+                scheduler.Finish(); // earlier frames' commands may still use the old copy
+                Metal::TextureDesc desc{};
+                desc.pixel_format = format;
+                desc.width = ow;
+                desc.height = oh;
+                ui_scene_image = Metal::CreateTexture(device, desc, "Frame generation UI scene",
+                                                      nullptr);
+                ui_scene_width = ow;
+                ui_scene_height = oh;
+            }
+            if (ui_scene_image) {
+                scheduler.Record([ui, copy = ui_scene_image.Get()](Metal::Encoder& e) {
+                    BbFrameGen::CopyTexture(e, ui, copy);
+                });
+                std::scoped_lock lock{frame_gen_mutex};
+                frame_gen_inputs.ui_final = ui;
+                frame_gen_inputs.ui_scene = ui_scene_image.Get();
+            }
+        }
         reset = false;
         dispatched_last_frame = true;
         if (const int dump = DumpFrame(); dump >= 0) {
