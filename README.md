@@ -5,6 +5,9 @@
 newer. It does not include the game: on first launch you choose your own game folder. The first
 time, release it from quarantine as described in [Download](#download-no-building-needed).
 
+[![Buy me a coffee](https://img.shields.io/badge/Buy_me_a_coffee-PayPal-0070BA?logo=paypal&logoColor=white)](https://www.paypal.com/cgi-bin/webscr?cmd=_xclick&business=sk083672%40gmail.com&item_name=Buy%20me%20a%20coffee&currency_code=USD)
+Enjoying it? You can support the work with a coffee through PayPal, any amount.
+
 A **work-in-progress macOS port** of the native Bloodborne PC port. It runs the original PS4
 executable of *Bloodborne* (CUSA03173, version 1.09) on Apple Silicon Macs: the game's own
 x86-64 code executes directly under **Rosetta 2**, PS4 system libraries are replaced by a
