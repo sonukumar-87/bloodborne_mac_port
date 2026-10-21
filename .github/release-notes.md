@@ -1,4 +1,4 @@
-The first release of this Bloodborne macOS version: a launcher app for Apple Silicon Macs that runs your own copy of Bloodborne. **No game files are included.**
+Bloodborne for Mac: a launcher app for Apple Silicon Macs that runs your own copy of Bloodborne. **No game files are included.**
 
 ## Download
 
@@ -16,12 +16,22 @@ The first release of this Bloodborne macOS version: a launcher app for Apple Sil
 2. The app is not signed with an Apple developer certificate, so release it from quarantine once. In Terminal: `xattr -dr com.apple.quarantine /Applications/Bloodborne.app` (or open it, then click **Open Anyway** in System Settings → Privacy & Security).
 3. Open it. In the launcher, choose your game folder under **Locations**, pick your settings and press **Play**. If Rosetta 2 is missing, the launcher offers to install it.
 
-## What's new
+Saves and settings are kept in `~/Library/Application Support/Bloodborne`.
+
+## Features
+
+### Launcher
+
+- Choose your game folder and save folder, then press **Play**.
+- **Display**: output resolution, full screen or windowed, frame rate cap, FPS counter.
+- **Upscaler**: FSR 3.1, MetalFX or TAA with quality presets and sharpening.
+- **Effects**: turn depth of field, motion blur, chromatic aberration, ambient occlusion, dynamic shadows, screen-space reflections and the game's anti-aliasing on or off.
+- Native **Metal renderer**, skip intro videos, shader compilation options.
 
 ### Frame generation
 
 - **MetalFX frame interpolation** (macOS 26): a generated frame between every two real frames, so a 60 FPS cap shows 120 FPS on a 120 Hz display.
-- Launcher switch: **Frame generation: Off / 2×** under *Upscaler*. It needs the Metal renderer and an upscaler (FSR 3.1, MetalFX or TAA).
+- **Frame generation: Off / 2×** in the launcher, under *Upscaler*. It works with the Metal renderer and an upscaler (FSR 3.1, MetalFX or TAA).
 - The HUD stays steady over the generated frames.
 
 ### Keyboard and mouse
@@ -33,13 +43,4 @@ The first release of this Bloodborne macOS version: a launcher app for Apple Sil
 
 ### The Old Hunters (DLC)
 
-- Extracted add-ons are reported as installed. Put the add-on folder (the one that contains `sce_sys/param.sfo`) in `~/Library/Application Support/Bloodborne/addcont/`.
-
-## Fixes
-
-- Frame generation no longer shows dark, blinking frames or wrong colours while the HUD is on screen.
-
-## Notes
-
-- Saves and settings: `~/Library/Application Support/Bloodborne`. Log: `~/Library/Logs/Bloodborne/game.log`.
-- Built on the Bloodborne macOS port 0.5.0 by Wooloomooloo2. Licence: GPL-2.0-or-later. The source code of this release is the `mac-v1.0.0` tag.
+- Put the extracted add-on folder (the one that contains `sce_sys/param.sfo`) in `~/Library/Application Support/Bloodborne/addcont/` and the game sees The Old Hunters as installed.
