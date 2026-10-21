@@ -1,5 +1,10 @@
 # bloodborne_mac_port: Bloodborne on macOS (Apple Silicon)
 
+**[Download Bloodborne for Mac](https://github.com/sonukumar-87/bloodborne_mac_port/releases/latest)**
+(`Bloodborne-macOS-<version>.zip`): the ready-to-run app for Apple Silicon Macs with macOS 15 or
+newer. It does not include the game: on first launch you choose your own game folder. The first
+time, release it from quarantine as described in [Download](#download-no-building-needed).
+
 A **work-in-progress macOS port** of the native Bloodborne PC port. It runs the original PS4
 executable of *Bloodborne* (CUSA03173, version 1.09) on Apple Silicon Macs: the game's own
 x86-64 code executes directly under **Rosetta 2**, PS4 system libraries are replaced by a

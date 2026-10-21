@@ -160,7 +160,7 @@ EOF
 commit=$(git rev-parse --short HEAD)
 cat > "$lic/README.txt" <<EOF
 Bloodborne macOS port $version (commit $commit)
-Source code: https://github.com/Wooloomooloo2/bloodborne_mac_port/tree/$commit
+Source code: https://github.com/${GITHUB_REPOSITORY:-sonukumar-87/bloodborne_mac_port}/tree/$commit
 The port is licensed GPL-2.0-or-later (LICENSE-bloodborne-mac-port.txt); the other files are
 the licences of the libraries and code it bundles or compiles in. No game files are included.
 EOF
@@ -172,7 +172,7 @@ cat > "$contents/Info.plist" <<EOF
 <dict>
     <key>CFBundleName</key><string>Bloodborne</string>
     <key>CFBundleDisplayName</key><string>Bloodborne</string>
-    <key>CFBundleIdentifier</key><string>io.github.wooloomooloo2.bloodborne-mac-port</string>
+    <key>CFBundleIdentifier</key><string>io.github.sonukumar-87.bloodborne-mac-port</string>
     <key>CFBundleExecutable</key><string>Bloodborne</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>${version%%-*}</string>
